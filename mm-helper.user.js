@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MM helper – Αρχείο Ιατρείου
 // @namespace    psarris.mymedical
-// @version      1.0.5
-// @description  Εντολές window.MM για ελεγχόμενη καταχώριση εργαστηριακών στο MyMedical και ανάγνωση ΠΗΤ εγκύων. Καμία λειτουργία διαγραφής.
+// @version      1.0.6
+// @description  Εντολές window.MM για ελεγχόμενη καταχώριση εργαστηριακών και ΙΣΤΟΡΙΚΟΥ (ομάδα αίματος, ηλεκτροφόρηση, κυστική ίνωση, δρεπάνωση) στο MyMedical, έλεγχο ήδη περασμένων τιμών και ανάγνωση ΠΗΤ εγκύων. Καμία λειτουργία διαγραφής.
 // @match        https://ju1938.my-medical.online/*
 // @grant        none
 // @run-at       document-idle
@@ -15,13 +15,17 @@
   - Τιμή γράφεται ΜΟΝΟ αν υπάρχει στο εγκεκριμένο πλάνο (MM.plan) με ίδιο ΑΜΚΑ, ημ/νία στήλης, τύπο, πεδίο και τιμή.
   - Κελί που έχει ήδη τιμή δεν αλλάζει ποτέ.
   - Μετά από κάθε τιμή ελέγχεται ότι δεν άλλαξε κανένα άλλο κελί της στήλης.
+  - MM.have() και MM.hist() μόνο ΔΙΑΒΑΖΟΥΝ.
+  - ΙΣΤΟΡΙΚΟ: MM.histSet() συμπληρώνει ΜΟΝΟ κενά πεδία του εγκεκριμένου πλάνου (MM.histPlan) από λίστα 11 επιτρεπτών πεδίων·
+    αν κάποιο πεδίο του πλάνου έχει ήδη άλλη τιμή, δεν αλλάζει τίποτα. MM.histSave() πατά την κανονική αποθήκευση της καρτέλας
+    ΜΟΝΟ αν, σε σχέση με το στιγμιότυπο πριν από το histSet, άλλαξαν μόνο τα πεδία του πλάνου και έχουν ακριβώς τις τιμές του.
   - Αποθήκευση αρχείων (Αρχεία) δεν γίνεται από εδώ· το MM.attSet μόνο συμπληρώνει πεδία.
   - Το MM.pht() μόνο ΔΙΑΒΑΖΕΙ (λίστα εγκύων, banner, ΙΣΤΟΡΙΚΟ, ΕΓΚΥΜΟΣΥΝΗ)· δεν πατά ποτέ αποθήκευση.
 */
 (function () {
   'use strict';
   const W = window;
-  if (W.MM && W.MM.v && W.MM.v >= '1.0.5') return;
+  if (W.MM && W.MM.v && W.MM.v >= '1.0.6') return;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const jq = () => W.jQuery;
@@ -244,6 +248,138 @@
     return lines.join('; ');
   }
 
+  // ---------- Έλεγχος ήδη περασμένων τιμών (ΜΟΝΟ ανάγνωση) ----------
+  // Μετά από MM.exams(τύπος). MM.have([{date:'ΗΗ-ΜΜ-ΕΕΕΕ', field:19, value:'12,5'}, ...]) →
+  //   ✓ υπάρχει ίδια τιμή στην ίδια ημ/νία · ≠(τιμή) άλλη τιμή στην ίδια ημ/νία · ~(ημ/νία) ίδια τιμή σε άλλη στήλη · ✗ λείπει
+  // MM.have() χωρίς όρισμα: όλες οι συμπληρωμένες τιμές του τύπου, ανά στήλη.
+  const vnorm = s => norm(s).replace(/\s/g, '').replace(',', '.').toLowerCase();
+  const isNum = s => /^[-+]?\d+(\.\d+)?$/.test(s);
+  const sameVal = (a, b) => { const x = vnorm(a), y = vnorm(b); return x === y || (isNum(x) && isNum(y) && parseFloat(x) === parseFloat(y)); };
+  function have(list) {
+    const c = ctxCheck(); if (c) return c;
+    if (dupCols()) return 'ΣΦΑΛΜΑ: διπλές στήλες — reload και ξανά MM.exams';
+    const type = typeSel() && typeSel().value;
+    const ids = cols().map(x => x.split(':')[0]);
+    if (!Array.isArray(list)) return `τύπος ${type} :: ` + (ids.map(read).join(' ; ').replace(/=/g, ':') || 'καμία στήλη');
+    const maps = ids.map(id => ({ date: colDate(id), m: cellMap(id) }));
+    const out = list.map(e => {
+      const f = String(e.field), v = norm(e.value), d = e.date;
+      const col = maps.find(x => x.date === d);
+      const here = col ? col.m[f] || '' : '';
+      let s;
+      if (here && sameVal(here, v)) s = '✓';
+      else if (here) s = `≠(${here})`;
+      else { const o = maps.find(x => x.m[f] && sameVal(x.m[f], v)); s = o ? `~(${o.date})` : '✗'; }
+      return `${s} f${f} ${v} ${d}`;
+    });
+    const n = k => out.filter(x => x.startsWith(k)).length;
+    return `τύπος ${type} | ✓${n('✓')} ≠${n('≠')} ~${n('~')} ✗${n('✗')} :: ` + out.join('; ');
+  }
+
+  // ---------- ΙΣΤΟΡΙΚΟ (ομάδα αίματος, Rh, ηλεκτροφόρηση, κυστική ίνωση, δρεπάνωση — γυναίκα και σύζυγος) ----------
+  const HK = ['omada_aimatos', 'rhesus', 'ilektroforisi_custom', 'ilektroforisi_comments', 't31', 'drepanosi',
+    'omada_aimatos_sizigou', 'rhesus_sizigou', 'ilektroforisi_sizigou', 'ilektroforisi_comments_s', 't32'];
+  const HL = { omada_aimatos: 'ΟΑ', rhesus: 'Rh', ilektroforisi_custom: 'ΗλΦ', ilektroforisi_comments: 'ΗλΦσχ', t31: 'ΚΙ', drepanosi: 'Δρεπ',
+    omada_aimatos_sizigou: 'ΟΑσ', rhesus_sizigou: 'Rhσ', ilektroforisi_sizigou: 'ΗλΦσ', ilektroforisi_comments_s: 'ΗλΦσχσ', t32: 'ΚΙσ' };
+  const hEl = k => document.querySelector('#AirGynaikology-form [name="AirGynaikology[' + k + ']"]');
+  const hVal = el => !el ? null : el.tagName === 'SELECT'
+    ? (el.value && el.value !== '0' && el.selectedIndex >= 0 ? norm(el.options[el.selectedIndex].text) : '')
+    : norm(el.value);
+  const bEl = k => document.querySelector('#basic_derma_form [name="AirPelates[' + k + ']"]');
+  async function histReady() {
+    const t = document.getElementById('ginaikologiko-istoriko-tab'); if (t) t.click();
+    return !!(await waitFor(() => hEl('t31') && hEl('t32') && document.getElementById('basic_derma_form'), 15000));
+  }
+  // MM.hist([ΑΜΚΑ από την εξέταση του συζύγου]) — μία γραμμή· με όρισμα ελέγχει και το «ΑΜΚΑ Συζύγου» των ΒΑΣΙΚΩΝ
+  async function hist(amkaS) {
+    const c = ctxCheck(); if (c) return c;
+    if (!await histReady()) return 'ΣΦΑΛΜΑ: δεν φόρτωσε το ΙΣΤΟΡΙΚΟ — reload';
+    const s = HK.map(k => `${HL[k]} ${hVal(hEl(k)) || '—'}`).join(' | ');
+    const sn = [bEl('sizigou'), bEl('c_t_142')].map(e => e ? norm(e.value) : '').join(' ').trim();
+    const sa = bEl('c_t_143') ? bEl('c_t_143').value.replace(/\D/g, '') : '';
+    let m = '';
+    if (amkaS) m = !sa ? ' | ΑΜΚΑ συζύγου ΚΕΝΟ στα ΒΑΣΙΚΑ' : sa === String(amkaS) ? ' | ΑΜΚΑ συζύγου ταιριάζει' : ' | ΑΜΚΑ συζύγου ΔΙΑΦΕΡΕΙ';
+    return `${s} || σύζυγος: ${sn || '—'} ΑΜΚΑ …${sa ? sa.slice(-4) : '—'}${m}`;
+  }
+  // MM.histPlan({amka:'ΑΜΚΑ ασθενούς', set:{omada_aimatos:'Α', rhesus:'Θετικό (+)', t32:'CFTR 90% αρνητικό'}}) — ακριβώς η εγκεκριμένη λίστα
+  // (τιμές = το ΚΕΙΜΕΝΟ της επιλογής όπως φαίνεται στο MyMedical)
+  function histPlan(o) {
+    if (o === undefined) {
+      const h = ss.get('hplan', null);
+      return h ? `ΙΣΤΟΡΙΚΟ πλάνο …${h.amka.slice(-4)}: ` + Object.keys(h.set).map(k => `${HL[k]} ${h.set[k]}`).join(' | ') : 'κανένα πλάνο ΙΣΤΟΡΙΚΟΥ';
+    }
+    if (!o || !/^\d{11}$/.test(String(o.amka)) || !o.set || !Object.keys(o.set).length) return 'ΣΦΑΛΜΑ: {amka, set:{πεδίο:τιμή}}';
+    const bad = Object.keys(o.set).filter(k => !HK.includes(k) || !norm(o.set[k]));
+    if (bad.length) return 'ΣΦΑΛΜΑ: μη επιτρεπτά ή κενά πεδία ' + bad.join(',');
+    const set = {}; Object.keys(o.set).forEach(k => { set[k] = norm(o.set[k]); });
+    ss.set('hplan', { amka: String(o.amka), set });
+    ss.set('hsnap', null);
+    return `OK πλάνο ΙΣΤΟΡΙΚΟΥ ${Object.keys(set).length} πεδίων`;
+  }
+  function snapAll() {
+    const o = {};
+    document.querySelectorAll('#basic_derma_form [name], #AirGynaikology-form [name]').forEach((e, i) => {
+      if (e.type === 'file') return;
+      o[e.name + '#' + i] = (e.type === 'checkbox' || e.type === 'radio') ? String(e.checked) : String(e.value);
+    });
+    return o;
+  }
+  async function histSet() {
+    const c = ctxCheck(); if (c) return c;
+    const h = ss.get('hplan', null);
+    if (!h || h.amka !== pat().amka) return 'ΣΦΑΛΜΑ: κανένα εγκεκριμένο πλάνο ΙΣΤΟΡΙΚΟΥ για αυτή την ασθενή';
+    if (!await histReady()) return 'ΣΦΑΛΜΑ: δεν φόρτωσε το ΙΣΤΟΡΙΚΟ — reload';
+    await sleep(500);
+    const before = snapAll();
+    const res = [], todo = [];
+    for (const k of Object.keys(h.set)) {
+      const el = hEl(k), want = h.set[k], cur = hVal(el);
+      if (!el) { res.push(`${HL[k]} ΣΦΑΛΜΑ: δεν βρέθηκε πεδίο`); continue; }
+      if (cur) { res.push(cur === want ? `${HL[k]} ✓ υπήρχε ήδη` : `${HL[k]} ΑΡΝΗΣΗ: έχει ήδη «${cur}»`); continue; }
+      if (el.tagName === 'SELECT') {
+        const op = [...el.options].find(x => norm(x.text) === want && x.value !== '0' && x.value !== '');
+        if (!op) { res.push(`${HL[k]} ΣΦΑΛΜΑ: δεν υπάρχει επιλογή «${want}»`); continue; }
+        todo.push({ el, v: op.value, k });
+      } else todo.push({ el, v: want, k });
+    }
+    if (res.some(r => /ΣΦΑΛΜΑ|ΑΡΝΗΣΗ/.test(r))) return 'ΣΤΟΠ — τίποτα δεν άλλαξε :: ' + res.join(' | ');
+    if (!todo.length) return 'τίποτα για συμπλήρωση :: ' + res.join(' | ');
+    todo.forEach(t => { jq()(t.el).val(t.v).trigger('change'); t.el.dispatchEvent(new Event('input', { bubbles: true })); });
+    await sleep(400);
+    const after = snapAll();
+    const names = todo.map(t => t.el.name);
+    const other = Object.keys(after).filter(k => after[k] !== before[k] && !names.includes(k.split('#')[0]));
+    if (other.length || Object.keys(after).length !== Object.keys(before).length)
+      return 'ΠΡΟΣΟΧΗ: άλλαξαν και άλλα πεδία (' + other.join(',') + ') — ΜΗΝ αποθηκεύσεις· reload';
+    ss.set('hsnap', { id: pat().id, before, names });
+    return 'OK συμπληρώθηκαν (ΔΕΝ αποθηκεύτηκαν): ' + todo.map(t => `${HL[t.k]} ${hVal(t.el)}`).concat(res).join(' | ') + ' → MM.histSave()';
+  }
+  function histSave() {
+    const c = ctxCheck(); if (c) return c;
+    const s = ss.get('hsnap', null), h = ss.get('hplan', null);
+    if (!s || s.id !== pat().id || !h || h.amka !== pat().amka) return 'ΣΦΑΛΜΑ: πρώτα MM.histSet()';
+    const now = snapAll();
+    const extra = Object.keys(now).filter(k => now[k] !== s.before[k] && !s.names.includes(k.split('#')[0]));
+    if (extra.length || Object.keys(now).length !== Object.keys(s.before).length)
+      return 'ΠΡΟΣΟΧΗ: η σελίδα διαφέρει από το στιγμιότυπο (' + extra.join(',') + ') — ΔΕΝ αποθηκεύτηκε';
+    const wrong = s.names.filter(n => { const k = (n.match(/\[(.+)\]/) || [])[1]; return hVal(hEl(k)) !== h.set[k]; });
+    if (wrong.length) return 'ΠΡΟΣΟΧΗ: τιμές διαφορετικές από το πλάνο (' + wrong.join(',') + ') — ΔΕΝ αποθηκεύτηκε';
+    const b = document.getElementById('air-pelates-save');
+    if (!visible(b)) return 'ΣΦΑΛΜΑ: δεν βρέθηκε ορατό κουμπί αποθήκευσης';
+    ss.set('hsnap', null);
+    b.click();
+    return 'αποθήκευση… η σελίδα θα ξαναφορτώσει → μετά await MM.histCheck()';
+  }
+  // Μετά από reload: σύγκριση ΙΣΤΟΡΙΚΟΥ με το πλάνο
+  async function histCheck() {
+    const c = ctxCheck(); if (c) return c;
+    const h = ss.get('hplan', null);
+    if (!h || h.amka !== pat().amka) return 'κανένα πλάνο ΙΣΤΟΡΙΚΟΥ για αυτή την ασθενή';
+    if (!await histReady()) return 'ΣΦΑΛΜΑ: δεν φόρτωσε το ΙΣΤΟΡΙΚΟ — reload';
+    await sleep(500);
+    return Object.keys(h.set).map(k => { const got = hVal(hEl(k)); return `${got === h.set[k] ? 'OK' : 'ΛΑΘΟΣ'} ${HL[k]}: αναμ. ${h.set[k]}, βρέθηκε ${got || 'κενό'}`; }).join('; ');
+  }
+
   // ---------- Αρχεία (μόνο συμπλήρωση/ανάγνωση, ΠΟΤΕ αποθήκευση) ----------
   function attField(name) {
     // το πεδίο του δεξιού panel (υπάρχει και ομώνυμο φίλτρο στη λίστα)
@@ -358,7 +494,7 @@
     ).join(' ;; ').replace(/[=&?]/g, ' ').replace(/\d{9,}/g, '#');
   }
 
-  const help = () => 'MM: plan(list) · patient(επώνυμο, ΑΜΚΑ) · go() / go("files") · exams(τύπος) · addColumn("ΗΗ-ΜΜ-ΕΕΕΕ") · setCell(testId, field, τιμή) · read(testId) · check() · attForm() · attSet({...}) · attList([κείμενο]) · pht([αρχή|"new"])';
+  const help = () => 'MM: plan(list) · patient(επώνυμο, ΑΜΚΑ) · go() / go("files") · exams(τύπος) · have([{date,field,value}]) · addColumn("ΗΗ-ΜΜ-ΕΕΕΕ") · setCell(testId, field, τιμή) · read(testId) · check() · hist([ΑΜΚΑ συζύγου]) · histPlan({amka,set}) · histSet() · histSave() · histCheck() · attForm() · attSet({...}) · attList([κείμενο]) · pht([αρχή|"new"])';
 
-  W.MM = { v: '1.0.5', help, plan, patient, go, exams, cols, addColumn, setCell, read, check, attForm, attSet, attList, pht };
+  W.MM = { v: '1.0.6', help, plan, patient, go, exams, cols, have, addColumn, setCell, read, check, hist, histPlan, histSet, histSave, histCheck, attForm, attSet, attList, pht };
 })();
