@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MM helper – Αρχείο Ιατρείου
 // @namespace    psarris.mymedical
-// @version      1.0.6
+// @version      1.0.7
 // @description  Εντολές window.MM για ελεγχόμενη καταχώριση εργαστηριακών και ΙΣΤΟΡΙΚΟΥ (ομάδα αίματος, ηλεκτροφόρηση, κυστική ίνωση, δρεπάνωση) στο MyMedical, έλεγχο ήδη περασμένων τιμών και ανάγνωση ΠΗΤ εγκύων. Καμία λειτουργία διαγραφής.
 // @match        https://ju1938.my-medical.online/*
 // @grant        none
@@ -25,7 +25,7 @@
 (function () {
   'use strict';
   const W = window;
-  if (W.MM && W.MM.v && W.MM.v >= '1.0.6') return;
+  if (W.MM && W.MM.v && W.MM.v >= '1.0.7') return;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const jq = () => W.jQuery;
@@ -413,7 +413,7 @@
     jq()('#AirAttachments_typeId').selectivity('data', { id: o.cat, text: o.catText });
     const d = document.getElementById('AirAttachments_imnia');
     if (d) { d.value = o.date; d.dispatchEvent(new Event('change', { bubbles: true })); }
-    return 'OK συμπληρώθηκε (ΔΕΝ αποθηκεύτηκε) | ' + attForm();
+    return S('OK συμπληρώθηκε (ΔΕΝ αποθηκεύτηκε) | ' + attForm() + ' | αποθήκευση: native κλικ στο ' + attSaveXY());
   }
   // σύνοψη λίστας· με όρισμα: μόνο οι γραμμές που περιέχουν το κείμενο
   function attList(q) {
@@ -494,7 +494,131 @@
     ).join(' ;; ').replace(/[=&?]/g, ' ').replace(/\d{9,}/g, '#');
   }
 
-  const help = () => 'MM: plan(list) · patient(επώνυμο, ΑΜΚΑ) · go() / go("files") · exams(τύπος) · have([{date,field,value}]) · addColumn("ΗΗ-ΜΜ-ΕΕΕΕ") · setCell(testId, field, τιμή) · read(testId) · check() · hist([ΑΜΚΑ συζύγου]) · histPlan({amka,set}) · histSet() · histSave() · histCheck() · attForm() · attSet({...}) · attList([κείμενο]) · pht([αρχή|"new"])';
 
-  W.MM = { v: '1.0.6', help, plan, patient, go, exams, cols, have, addColumn, setCell, read, check, hist, histPlan, histSet, histSave, histCheck, attForm, attSet, attList, pht };
+  // ================= 1.0.7: λιγότερες κλήσεις =================
+  const S = x => String(x).replace(/[=&?]/g, ':');
+  const btnXY = el => { if (!el) return '—'; const r = el.getBoundingClientRect(); return Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2); };
+
+  // MM.find('ΕΠΩΝΥΜΟ', 'ΗΗ/ΜΜ/ΕΕΕΕ') — ΜΟΝΟ ανάγνωση: ασθενείς με αυτό το επώνυμο· με ημ. γέννησης κρατά όσους το ΑΜΚΑ αρχίζει με ΗΗΜΜΕΕ
+  async function find(lastname, dob) {
+    const up = s => norm(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase();
+    const res = await fetch('/airPelates/admin?' + encodeURIComponent('AirPelates[lastname]') + '=' + encodeURIComponent(lastname) + '&gridPageSize=300', { credentials: 'same-origin' });
+    if (!res.ok) return 'ΣΦΑΛΜΑ HTTP ' + res.status;
+    const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+    const hdr = [...doc.querySelectorAll('table thead tr')].map(r => [...r.children].map(c => norm(c.textContent))).find(r => r.includes('ΑΜΚΑ'));
+    if (!hdr) return 'ΣΦΑΛΜΑ: δεν βρέθηκε στήλη ΑΜΚΑ';
+    const ai = hdr.indexOf('ΑΜΚΑ'), li = hdr.indexOf('Επώνυμο'), fi = hdr.indexOf('Όνομα');
+    let rows = [...doc.querySelectorAll('tbody tr')].filter(tr => tr.querySelector('a[href*="/airPelates/update/"]')).map(tr => ({
+      amka: tr.children[ai] ? tr.children[ai].textContent.replace(/\D/g, '') : '',
+      last: norm(tr.children[li] && tr.children[li].textContent), first: norm(tr.children[fi] && tr.children[fi].textContent)
+    })).filter(r => up(r.last) === up(lastname));
+    if (dob) {
+      const m = String(dob).match(/(\d{1,2})\D(\d{1,2})\D(\d{2,4})/);
+      if (m) { const pre = m[1].padStart(2, '0') + m[2].padStart(2, '0') + m[3].slice(-2); rows = rows.filter(r => r.amka.startsWith(pre)); }
+    }
+    return `${rows.length} ασθενείς: ` + rows.map(r => `${r.last} ${r.first} ΑΜΚΑ ${r.amka}`).join(' ; ');
+  }
+
+  // MM.batch({amka, type, date:'ΗΗ-ΜΜ-ΕΕΕΕ', set:[[πεδίο,'τιμή'],…], dry})
+  // = MM.plan(ακριβώς αυτές) + exams(type) + have + (αν όχι dry) addColumn + setCell μία-μία, στοπ στο 1ο μη-OK.
+  // ΠΡΕΠΕΙ να αντιστοιχεί ακριβώς στον εγκεκριμένο πίνακα. Κελιά με τιμή ΔΕΝ αλλάζουν (setCell αρνείται).
+  async function batch(o) {
+    const c = ctxCheck(); if (c) return S(c);
+    if (!o || !Array.isArray(o.set) || !o.set.length) return 'ΣΦΑΛΜΑ: {amka,type,date,set:[[πεδίο,τιμή]]}';
+    if (o.amka !== pat().amka) return 'ΣΦΑΛΜΑ: το ΑΜΚΑ δεν είναι της ασθενούς του MM.patient';
+    const r0 = await exams(o.type); if (!r0.startsWith('OK')) return S(r0);
+    const h = have(o.set.map(([f, v]) => ({ date: o.date, field: f, value: v })));
+    if (o.dry) return S('DRY ' + h);
+    const todo = o.set.filter(([f, v]) => h.includes(`✗ f${f} ${norm(v)} `));
+    const skip = o.set.length - todo.length;
+    if (!todo.length) return S('τίποτα για καταχώριση :: ' + h);
+    const pr = plan(todo.map(([f, v]) => ({ amka: o.amka, date: o.date, type: o.type, field: f, value: v })));
+    if (!pr.startsWith('OK')) return S(pr);
+    const col = await addColumn(o.date); if (!col.startsWith('OK')) return S(col);
+    const tid = (col.match(/testId=(\d+)/) || [])[1];
+    const out = [];
+    for (const [f, v] of todo) {
+      const r = await setCell(tid, f, v); out.push(r);
+      if (!r.startsWith('OK')) return S(`ΣΤΟΠ στο f${f} :: ` + out.join(' ; ') + ' → reload, MM.read(' + tid + '), ενημέρωση ιατρού');
+    }
+    return S(`OK ${todo.length} τιμές στη στήλη ${tid} (${o.date})` + (skip ? ` · ${skip} παραλείφθηκαν (✓/≠/~ — δες have)` : '') + ' → reload και MM.verify(' + o.type + ')');
+  }
+
+  // Μετά από reload: περιμένει τη σελίδα, ξαναδοκιμάζει, συγκρίνει με το πλάνο
+  async function verify(type) {
+    const t0 = Date.now();
+    for (let i = 0; i < 4 && Date.now() - t0 < 30000; i++) {
+      await sleep(i ? 2500 : 1500);
+      const c = ctxCheck(); if (c) continue;
+      const r = await exams(type); if (!r.startsWith('OK')) continue;
+      const k = check();
+      if (!/καμία εγγραφή|—|κενό/.test(k)) return S(k);
+      if (i === 3) return S(k);
+    }
+    return 'ΑΝΑΜΟΝΗ: η σελίδα δεν σταθεροποιήθηκε σε 30″ — ξανά MM.verify(' + type + ')';
+  }
+
+  // ---- ΒΑΣΙΚΑ (μόνο στοιχεία συζύγου, μόνο κενά πεδία) ----
+  const BK = ['sizigou', 'c_t_142', 'c_t_143', 'c_t_144'];
+  function basicSet(o) {
+    const c = ctxCheck(); if (c) return S(c);
+    const bad = Object.keys(o || {}).filter(k => !BK.includes(k) || !norm(o[k]));
+    if (!o || !Object.keys(o).length || bad.length) return 'ΣΦΑΛΜΑ: επιτρέπονται μόνο ' + BK.join(',');
+    const before = snapAll(), res = [];
+    for (const k of Object.keys(o)) {
+      const el = bEl(k);
+      if (!el) return 'ΣΦΑΛΜΑ: δεν βρέθηκε ' + k;
+      if (norm(el.value)) { res.push(norm(el.value) === norm(o[k]) ? `${k} ✓ υπήρχε` : `${k} ΑΡΝΗΣΗ έχει «${norm(el.value)}»`); }
+    }
+    if (res.some(r => /ΑΡΝΗΣΗ/.test(r))) return S('ΣΤΟΠ — τίποτα δεν άλλαξε :: ' + res.join(' | '));
+    const keys = Object.keys(o).filter(k => !norm(bEl(k).value));
+    if (!keys.length) return S('τίποτα για συμπλήρωση :: ' + res.join(' | '));
+    keys.forEach(k => { const el = bEl(k); el.value = norm(o[k]); el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); });
+    const after = snapAll(), names = keys.map(k => 'AirPelates[' + k + ']');
+    const other = Object.keys(after).filter(k => after[k] !== before[k] && !names.includes(k.split('#')[0]));
+    if (other.length) return S('ΠΡΟΣΟΧΗ: άλλαξαν και άλλα πεδία (' + other.join(',') + ') — ΜΗΝ αποθηκεύσεις· reload');
+    ss.set('bsnap', { id: pat().id, before, names, want: o });
+    return S('OK συμπληρώθηκαν (ΔΕΝ αποθηκεύτηκαν): ' + keys.map(k => k + ' ' + o[k]).concat(res).join(' | ') + ' → MM.basicSave()');
+  }
+  function basicSave() {
+    const c = ctxCheck(); if (c) return S(c);
+    const s = ss.get('bsnap', null);
+    if (!s || s.id !== pat().id) return 'ΣΦΑΛΜΑ: πρώτα MM.basicSet()';
+    const now = snapAll();
+    const extra = Object.keys(now).filter(k => now[k] !== s.before[k] && !s.names.includes(k.split('#')[0]));
+    if (extra.length) return S('ΠΡΟΣΟΧΗ: η σελίδα διαφέρει (' + extra.join(',') + ') — ΔΕΝ αποθηκεύτηκε');
+    const b = document.getElementById('air-pelates-save');
+    if (!visible(b)) return 'ΣΦΑΛΜΑ: δεν βρέθηκε κουμπί αποθήκευσης';
+    ss.set('bsnap', null); b.click();
+    return 'αποθήκευση… μετά reload και MM.hist()';
+  }
+
+  // ---- Αρχεία: νέα φόρμα ----
+  // await MM.attNew(): ανοίγει ΝΕΑ φόρμα αρχείου (κόκκινο «+») και ελέγχει ότι είναι νέα (κενή ονομασία, χωρίς αρχείο,
+  // σημερινή ημ/νία). Περιμένει πρώτα να φορτώσει το panel της 1ης γραμμής (αλλιώς το αντικαθιστά), έως 3 προσπάθειες.
+  function attIsNew() {
+    const nm = attField('AirAttachments[onoma]'), f = document.getElementById('AirAttachments_attach'), d = document.getElementById('AirAttachments_imnia');
+    const t = new Date(), today = String(t.getDate()).padStart(2, '0') + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + t.getFullYear();
+    return !!(nm && !norm(nm.value) && f && !f.files.length && d && d.value === today);
+  }
+  async function attNew() {
+    if (!/attachments/.test(location.pathname)) return 'ΣΦΑΛΜΑ: πρώτα MM.go("files")';
+    await sleep(2500);
+    for (let i = 0; i < 3; i++) {
+      if (attIsNew()) return 'OK νέα φόρμα';
+      const b = document.getElementById('add-file-button');
+      if (!b) return 'ΣΦΑΛΜΑ: δεν βρέθηκε το κόκκινο «+»';
+      b.click();
+      await sleep(2000);
+    }
+    return attIsNew() ? 'OK νέα φόρμα' : 'ΣΦΑΛΜΑ: δεν άνοιξε νέα φόρμα — native κλικ στο ' + btnXY(document.getElementById('add-file-button')) + ', μετά ξανά await MM.attNew()';
+  }
+  function attSaveXY() {
+    const b = [...document.querySelectorAll('button, input[type=submit], a')].find(e => visible(e) && /αποθήκευση αλλαγών/i.test(norm(e.textContent || e.value)));
+    return btnXY(b);
+  }
+
+  const help = () => 'MM 1.0.7: find(επώνυμο,ημ.γέννησης) · batch({amka,type,date,set,dry}) · verify(τύπος) · basicSet({sizigou,c_t_142,…}) · basicSave() · attNew() · plan(list) · patient(επώνυμο, ΑΜΚΑ) · go() / go("files") · exams(τύπος) · have([{date,field,value}]) · addColumn("ΗΗ-ΜΜ-ΕΕΕΕ") · setCell(testId, field, τιμή) · read(testId) · check() · hist([ΑΜΚΑ συζύγου]) · histPlan({amka,set}) · histSet() · histSave() · histCheck() · attForm() · attSet({...}) · attList([κείμενο]) · pht([αρχή|"new"])';
+
+  W.MM = { v: '1.0.7', help, find, batch, verify, basicSet, basicSave, attNew, plan, patient, go, exams, cols, have, addColumn, setCell, read, check, hist, histPlan, histSet, histSave, histCheck, attForm, attSet, attList, pht };
 })();
